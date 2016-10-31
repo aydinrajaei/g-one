@@ -1,0 +1,275 @@
+/* 
+ * Copyright 2014 Aydin Rajaei, University of Sussex.
+ * The Geo-One Simulator Project. 
+ */
+package routing;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import util.Tuple;
+import core.Cast;
+import core.Connection;
+import core.Coord;
+import core.GeoDTNHost;
+import core.GeoMessage;
+import core.Settings;
+
+/**
+ * Implementation of Geocasting Spray And Flood Router (GSAF)
+ *
+ */
+public class GSASPlusRouter extends GeoActiveRouter {
+	
+	/** identifier for the initial number of copies setting ({@value})*/ 
+	public static final String NROF_COPIES = "copyticket";
+	/** SprayAndWait router's settings name space ({@value})*/ 
+	public static final String GSAF_NS = "GSAFRouter";
+	/** Message property key */
+	public static final String MSG_COUNT_PROPERTY = "GSAFRouter" + "." +
+		"copies";
+	/** Message recipient direction key */
+	public static final String MSG_GSAS_DIRECTION_PROPERTY = "GSASRouterDirection" + "." +
+		"copies";
+	
+	/** Message delete flag */
+	public static final String MSG_GSAS_DELETE_PROPERTY = "GSASDeleteFlag" + "." +
+		"copies";
+	
+	/** Message delete flag */
+	public static final String MSG_GSAS_SELECT_PROPERTY = "GSASSelectFlag" + "." +
+		"copies";
+	
+	protected int initialNrofCopies;
+	
+	public GSASPlusRouter(Settings s) {
+		super(s);
+		Settings gsafSettings = new Settings(GSAF_NS);
+		
+		initialNrofCopies = gsafSettings.getInt(NROF_COPIES);
+	}
+	
+	/**
+	 * Copy constructor.
+	 * @param r The router prototype where setting values are copied from
+	 */
+	protected GSASPlusRouter(GSASPlusRouter r) {
+		super(r);
+		this.initialNrofCopies = r.initialNrofCopies;
+	}
+	
+	@Override
+	public int receiveGeoMessage(GeoMessage m, GeoDTNHost from) {
+		return super.receiveGeoMessage(m, from);
+	}
+	
+	@Override
+	//receiverSide
+	public GeoMessage geoMessageTransferred(String id, GeoDTNHost from) {
+		GeoMessage msg = super.geoMessageTransferred(id, from);
+		Integer nrofCopies = (Integer)msg.getProperty(MSG_COUNT_PROPERTY);
+		
+		assert nrofCopies != null : "Not a GSAF message: " + msg;
+		
+		if (nrofCopies > 0) {
+			nrofCopies --;
+		}
+		else {
+			nrofCopies = 0;
+		}
+		
+		msg.updateProperty(MSG_COUNT_PROPERTY, nrofCopies);
+		msg.updateProperty(MSG_GSAS_DELETE_PROPERTY, false);
+		return msg;
+	}
+	
+	@Override 
+	public boolean createNewGeoMessage(GeoMessage msg) {
+		makeRoomForNewGeoMessage(msg.getSize());
+		msg.setTtl(this.msgTtl);
+		msg.addProperty(MSG_COUNT_PROPERTY, new Integer(initialNrofCopies));
+		msg.addProperty(MSG_GSAS_DIRECTION_PROPERTY, new Integer(0));
+		msg.addProperty(MSG_GSAS_DELETE_PROPERTY, new Boolean(false));
+		msg.addProperty(MSG_GSAS_SELECT_PROPERTY, new Boolean(true));
+		addToGeoMessages(msg, true);
+		return true;
+	}
+	
+	/**
+	 * Returns a list of message-connections tuples of the messages whose
+	 * recipient is some host that we're connected to at the moment.
+	 * @return a list of message-connections tuples
+	 */
+	@Override
+	protected List<Tuple<GeoMessage, Connection>> getMessagesForConnected() {
+		if (getNrofGeoMessages() == 0 || getConnections().size() == 0) {
+			/* no messages -> empty list */
+			return new ArrayList<Tuple<GeoMessage, Connection>>(0); 
+		}
+
+		List<Tuple<GeoMessage, Connection>> forTuples = new ArrayList<Tuple<GeoMessage, Connection>>();
+		
+		for (GeoMessage m : getGeoMessageCollection()) {
+			for (Connection con : getConnections()) {
+				GeoDTNHost to = (GeoDTNHost) con.getOtherNode(getGeoHost());
+
+				if (m.getTo().checkThePoint(to.getLocation())) {
+					forTuples.add(new Tuple<GeoMessage, Connection>(m,con));
+					continue;
+				}
+			}
+		}
+		
+		for (GeoMessage m : getGeoMessageCollection()) {
+			for (Connection con : getConnections()) {
+				GeoDTNHost to = (GeoDTNHost) con.getOtherNode(getGeoHost());
+				int recipientDirection = (Integer) m.getProperty(MSG_GSAS_DIRECTION_PROPERTY);
+				int copyTicket = (Integer) m.getProperty(MSG_COUNT_PROPERTY);
+				boolean changeHand = (Boolean) m.getProperty(MSG_GSAS_SELECT_PROPERTY);
+				
+				//First Phase of Routing procedure
+				if ((copyTicket == 0) && (this.getGeoHost().getDirection() != recipientDirection) && (to.getDirection() == recipientDirection) && changeHand) {
+					forTuples.add(new Tuple<GeoMessage, Connection>(m,con));
+					m.updateProperty(MSG_GSAS_DELETE_PROPERTY, true);
+					m.updateProperty(MSG_GSAS_SELECT_PROPERTY, false);
+				}
+			}
+		}
+		
+		return forTuples;
+	}
+	
+	/**
+	 * Method is called just before a transfer is aborted at {@link #update()} 
+	 * due connection going down. This happens on the sending host. 
+	 * Subclasses that are interested of the event may want to override this. 
+	 * @param con The connection whose transfer was aborted
+	 */
+	@Override
+	protected void transferAborted(Connection con) {
+		super.transferAborted(con);
+		con.getGeoMessage().updateProperty(MSG_GSAS_DELETE_PROPERTY, false);
+		con.getGeoMessage().updateProperty(MSG_GSAS_SELECT_PROPERTY, true);	
+	}
+	
+	@Override
+	public void update() {
+		super.update();
+		
+		updateRecipientDirection();
+		
+		if (!canStartTransfer() || isTransferring()) {
+			return; // nothing to transfer or is currently transferring 
+		}
+
+		/* try messages that could be delivered to final recipient */
+		if (exchangeDeliverableGeoMessages() != null) {
+			return;
+		}
+		
+		/* create a list of SAWMessages that have copies left to distribute */
+		@SuppressWarnings(value = "unchecked")
+		List<GeoMessage> copiesLeft = sortByQueueMode(getGeoMessagesWithCopiesLeft());
+		
+		if (copiesLeft.size() > 0) {
+			/* try to send those messages */
+			this.tryMessagesToConnections(copiesLeft, getConnections());
+		}
+	}
+	
+	/**
+	 * Creates and returns a list of messages this router is currently
+	 * carrying and still has copies left to distribute (nrof copies > 1).
+	 * @return A list of messages that have copies left
+	 */
+	protected List<GeoMessage> getGeoMessagesWithCopiesLeft() {
+		List<GeoMessage> list = new ArrayList<GeoMessage>();
+
+		for (GeoMessage m : getGeoMessageCollection()) {
+			Integer nrofCopies = (Integer)m.getProperty(MSG_COUNT_PROPERTY);
+			assert nrofCopies != null : "GSAF message " + m + " didn't have " + 
+				"nrof copies property!";
+			if (nrofCopies > 0) {
+				list.add(m);
+			}
+		}
+		
+		return list;
+	}
+	
+	/**
+	 * Called just before a transfer is finalized (by 
+	 * {@link ActiveRouter#update()}).
+	 * Reduces the number of copies we have left for a message. 
+	 */
+	@Override
+	//senderSide
+	protected void transferDone(Connection con) {
+		Integer nrofCopies;
+		String msgId = con.getGeoMessage().getId();
+		/* get this router's copy of the message */
+		GeoMessage msg = getGeoMessage(msgId);
+
+		if (msg == null) { // message has been dropped from the buffer after..
+			return; // ..start of transfer -> no need to reduce amount of copies
+		}
+		
+		/* reduce the amount of copies left */
+		nrofCopies = (Integer)msg.getProperty(MSG_COUNT_PROPERTY);
+		if (nrofCopies > 0) {
+			nrofCopies --;
+		}
+		else {
+			nrofCopies = 0;
+		}
+		msg.updateProperty(MSG_COUNT_PROPERTY, nrofCopies);
+		
+		Boolean DeleteFlag = (Boolean) con.getGeoMessage().getProperty(MSG_GSAS_DELETE_PROPERTY);
+		if (DeleteFlag) {
+			this.removeFromGeoMessages(msgId);
+		}
+	
+	}
+	
+	protected void updateRecipientDirection() {
+		
+		for (GeoMessage m : getGeoMessageCollection()) {
+			int direction = 0;
+			Coord nearestPoint = m.getTo().getNearestPoint(this.getGeoHost().getLocation());
+			
+			double cX = nearestPoint.getX(); //futureX
+			double cY = nearestPoint.getY(); //futureY
+			double pX = this.getGeoHost().getLocation().getX(); //currentX 
+			double pY = this.getGeoHost().getLocation().getY(); //currentY 
+			
+			//StandStill
+			if (pY == cY && pX == cX) {
+				direction = 0;
+			}
+			
+			//North
+			else if (pY >= cY) {
+				
+				//NorthEast
+				if(pX <= cX){ direction = 1; }
+				//NorthWest
+				else if(pX > cX) { direction = 4; }
+			}
+			
+			//South
+			else if(pY < cY) {
+				//SoutEast
+				if(pX <= cX) { direction = 3; }
+				//SouthWest
+				else if (pX > cX) { direction = 2; }
+			}
+			
+			m.updateProperty(MSG_GSAS_DIRECTION_PROPERTY, direction);
+		}
+	}
+	
+	@Override
+	public GSASPlusRouter replicate() {
+		return new GSASPlusRouter(this);
+	}
+}
